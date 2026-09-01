@@ -156,6 +156,7 @@ async def main() -> None:
     current_time = datetime.now(timezone.utc)
     today = current_time.date().isoformat()
     state = load_state(today)
+    save_state(state)
     schedules = build_schedules(current_time)
     logging.info(f"Started. date={today}")
 
