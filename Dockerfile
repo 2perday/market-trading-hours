@@ -9,4 +9,6 @@ RUN uv pip install --system --no-cache -r requirements.txt
 
 COPY . /app
 
+RUN mkdir -p /app/data
+
 CMD ["python3", "src/app.py"]

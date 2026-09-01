@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import pytz
 import pandas_market_calendars as mcal
@@ -9,165 +12,171 @@ import holidays
 from telegram import Bot
 from dotenv import load_dotenv
 
-# 환경 변수 로드
 load_dotenv()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.DEBUG,
+    level=logging.INFO,
     datefmt="%Y/%m/%d %I:%M:%S %p",
 )
 
-exchanges = ["NYSE", "LSE"]
-
+EXCHANGES = ["NYSE", "LSE"]
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# 전역 timezone 객체
+STATE_FILE = Path(__file__).parent.parent / "data" / "state.json"
 KST = pytz.timezone("Asia/Seoul")
-EST = pytz.timezone("America/New_York")
+HOLIDAY_PROVIDERS = {"NYSE": holidays.US, "LSE": holidays.GB}
 
-# 캘린더 캐시
-calendar_cache = {}
+calendar_cache: dict = {}
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise RuntimeError("TELEGRAM_TOKEN and CHAT_ID must be set in .env")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
 
-def convert_to_kst(current_time):
-    return current_time.astimezone(KST).strftime("%H:%M")
+@dataclass
+class MarketSchedule:
+    exchange: str
+    open: datetime | None = None
+    close: datetime | None = None
+    holiday: str | None = None
+
+    @property
+    def is_holiday(self) -> bool:
+        return self.open is None
 
 
-def convert_to_est(current_time):
-    return current_time.astimezone(EST).strftime("%H:%M")
+def convert_to_kst(dt: datetime) -> str:
+    return dt.astimezone(KST).strftime("%H:%M")
 
 
-def check_est_edt(current_time):
-    return current_time.astimezone(EST).strftime("%Z")
-
-
-async def get_market_schedule(exchange, current_time):
+def get_market_schedule(exchange: str, current_time: datetime) -> object | None:
     if exchange not in calendar_cache:
         calendar_cache[exchange] = mcal.get_calendar(exchange)
-
-    market = calendar_cache[exchange]
-    calendar = market.schedule(start_date=current_time, end_date=current_time)
-
-    if not calendar.empty:
-        return calendar.iloc[0]
-    else:
-        return None
+    calendar = calendar_cache[exchange].schedule(
+        start_date=current_time, end_date=current_time
+    )
+    return calendar.iloc[0] if not calendar.empty else None
 
 
-async def get_market_holidays(exchange, current_time):
-    if exchange == "LSE":
-        market_holidays = holidays.GB()
-    elif exchange == "NYSE":
-        market_holidays = holidays.US()
-
-    if current_time in market_holidays:
-        return market_holidays[current_time]
-    else:
-        return "Weekend"
+def get_holiday_name(exchange: str, current_time: datetime) -> str:
+    return HOLIDAY_PROVIDERS[exchange]().get(current_time.date(), "Weekend")
 
 
-async def update_schedules(list_schedule, current_time):
-    list_schedule.clear()
-
-    for exchange in exchanges:
-        schedule = await get_market_schedule(exchange, current_time)
-
-        if schedule is not None:
-            list_schedule.append(
-                {
-                    "exchange": exchange,
-                    "open": schedule["market_open"],
-                    "close": schedule["market_close"],
-                }
+def build_schedules(current_time: datetime) -> list[MarketSchedule]:
+    result = []
+    for exchange in EXCHANGES:
+        row = get_market_schedule(exchange, current_time)
+        if row is not None:
+            result.append(
+                MarketSchedule(
+                    exchange=exchange,
+                    open=row["market_open"],
+                    close=row["market_close"],
+                )
             )
         else:
-            list_schedule.append({"exchange": exchange, "holiday?": 1})
-
-
-async def send_schedule_message(list_schedule, current_time):
-    message_parts = ["🕛 Today's Trading Hours\n"]
-
-    for schedule in list_schedule:
-        if "holiday?" not in schedule or schedule["holiday?"] != 1:
-            open_time_kst = convert_to_kst(schedule["open"])
-            close_time_kst = convert_to_kst(schedule["close"])
-
-            message_parts.extend(
-                [
-                    f"#{schedule['exchange']}",
-                    f"{open_time_kst} ~ {close_time_kst} KST 🇰🇷\n",
-                ]
-            )
-        else:
-            holiday_message = await get_market_holidays(
-                schedule["exchange"], current_time
-            )
-            message_parts.extend(
-                [f"#{schedule['exchange']}", f"Market Close\n{holiday_message}\n"]
-            )
-
-    processed_message = "\n".join(message_parts).rstrip()
-    await send_notification(CHAT_ID, processed_message)
-
-
-async def notify_market_open_or_close(list_schedule, message_sent, current_time):
-    current_time_str = current_time.strftime("%H:%M")
-
-    for schedule in list_schedule:
-        if "open" in schedule and "close" in schedule:
-            if (
-                schedule["open"].strftime("%H:%M") <= current_time_str
-            ) and not message_sent[schedule["exchange"]]["open"]:
-                await send_notification(
-                    CHAT_ID, f"🟢 #{schedule['exchange']} Market Open"
+            result.append(
+                MarketSchedule(
+                    exchange=exchange,
+                    holiday=get_holiday_name(exchange, current_time),
                 )
-                message_sent[schedule["exchange"]]["open"] = True
-
-            elif (
-                schedule["close"].strftime("%H:%M") <= current_time_str
-            ) and not message_sent[schedule["exchange"]]["close"]:
-                await send_notification(
-                    CHAT_ID, f"🔴 #{schedule['exchange']} Market Close"
-                )
-                message_sent[schedule["exchange"]]["close"] = True
+            )
+    return result
 
 
-async def send_notification(CHAT_ID, message):
+def load_state(today: str) -> dict:
+    if STATE_FILE.exists():
+        data = json.loads(STATE_FILE.read_text())
+        if data.get("date") == today:
+            logging.info(f"State loaded from file: {data}")
+            return data
+    return {"date": today, **{ex: {"open": False, "close": False} for ex in EXCHANGES}}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+async def send_notification(message: str) -> None:
     try:
         await bot.send_message(CHAT_ID, text=message)
-        logging.info(f"{message}")
+        logging.info(message)
     except Exception as e:
         logging.error(f"Error sending message: {e}")
 
 
-async def main():
-    last_update = None
-    list_schedule = []
-    message_sent = {exchange: {"open": False, "close": False} for exchange in exchanges}
+async def send_schedule_message(schedules: list[MarketSchedule]) -> None:
+    parts = ["🕛 Today's Trading Hours\n"]
+    for s in schedules:
+        if not s.is_holiday:
+            parts.extend(
+                [
+                    f"#{s.exchange}",
+                    f"{convert_to_kst(s.open)} ~ {convert_to_kst(s.close)} KST 🇰🇷\n",
+                ]
+            )
+        else:
+            parts.extend([f"#{s.exchange}", f"Market Close\n{s.holiday}\n"])
+    await send_notification("\n".join(parts).rstrip())
 
-    await update_schedules(list_schedule, datetime.now(timezone.utc))
-    logging.info(f"reset at {datetime.now()}.")
+
+async def notify_open_close(
+    schedules: list[MarketSchedule], state: dict, current_time: datetime
+) -> bool:
+    current_time_str = current_time.strftime("%H:%M")
+    changed = False
+
+    for s in schedules:
+        if s.is_holiday:
+            continue
+
+        if (
+            s.open.strftime("%H:%M") <= current_time_str
+            and not state[s.exchange]["open"]
+        ):
+            await send_notification(f"🟢 #{s.exchange} Market Open")
+            state[s.exchange]["open"] = True
+            changed = True
+
+        if (
+            s.close.strftime("%H:%M") <= current_time_str
+            and not state[s.exchange]["close"]
+        ):
+            await send_notification(f"🔴 #{s.exchange} Market Close")
+            state[s.exchange]["close"] = True
+            changed = True
+
+    return changed
+
+
+async def main() -> None:
+    current_time = datetime.now(timezone.utc)
+    today = current_time.date().isoformat()
+    state = load_state(today)
+    schedules = build_schedules(current_time)
+    logging.info(f"Started. date={today}")
+
     while True:
         current_time = datetime.now(timezone.utc)
+        current_date = current_time.date().isoformat()
 
-        if (current_time.hour == 0 and current_time.minute == 0) and (
-            last_update is None or current_time.date() > last_update.date()
-        ):
-            await update_schedules(list_schedule, current_time)
-            await send_schedule_message(list_schedule, current_time)
-            message_sent = {
-                exchange: {"open": False, "close": False} for exchange in exchanges
+        if current_date != state["date"]:
+            state = {
+                "date": current_date,
+                **{ex: {"open": False, "close": False} for ex in EXCHANGES},
             }
-            last_update = current_time
-            logging.info(f"reset at {current_time}.")
+            schedules = build_schedules(current_time)
+            await send_schedule_message(schedules)
+            save_state(state)
+            logging.info(f"Daily reset: {current_date}")
 
-        await notify_market_open_or_close(list_schedule, message_sent, current_time)
+        changed = await notify_open_close(schedules, state, current_time)
+        if changed:
+            save_state(state)
 
-        # 다음 체크까지 대기 시간 계산
         next_minute = current_time.replace(second=0, microsecond=0) + timedelta(
             minutes=1
         )
