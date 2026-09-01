@@ -98,6 +98,7 @@ def load_state(today: str) -> dict:
 def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2))
+    logging.info(f"State updated: {state}")
 
 
 async def send_notification(message: str) -> None:
